@@ -1,0 +1,15 @@
+{
+  "status": "BENCHMARK_COMPLETE",
+  "complete": true,
+  "record_count": 40,
+  "pilot_complete": false,
+  "dataset_complete": true,
+  "world_count": 20,
+  "requests_sent": 300,
+  "providers_reported": [
+    "InferenceNet"
+  ],
+  "failed_question_ids": [],
+  "failed_supported_rule_kinds": [],
+  "next_action": "Review raw outputs, errors, and parsing diagnostics before interpreting accuracy."
+}
