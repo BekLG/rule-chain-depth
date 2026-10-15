@@ -22,8 +22,8 @@ def main(argv: list[str] | None = None) -> int:
     full = commands.add_parser("author-benchmark", help="Freeze and validate the balanced 40-question dataset")
     full.add_argument("--output-dir", type=Path, default=Path("data/benchmark"))
     benchmark = commands.add_parser("benchmark", help="Compare PLN-RAG, normal RAG, and full context on identical questions")
-    benchmark.add_argument("--systems", nargs="+", choices=("pln_rag", "rag", "full_context"),
-                           default=["pln_rag", "rag", "full_context"])
+    benchmark.add_argument("--systems", nargs="+", choices=("pln_rag", "rag", "iterative_rag", "full_context"),
+                            default=["pln_rag", "rag", "iterative_rag", "full_context"])
     benchmark.add_argument("--dataset", choices=("benchmark", "pilot"), default="benchmark")
     benchmark.add_argument("--worlds", type=Path)
     benchmark.add_argument("--expected", type=Path)
@@ -35,6 +35,17 @@ def main(argv: list[str] | None = None) -> int:
     benchmark.add_argument("--normal-rag-repo", type=Path, default=Path("../normal-rag"))
     benchmark.add_argument("--qdrant-url")
     benchmark.add_argument("--ollama-url")
+    benchmark.add_argument("--rag-top-k", type=int, default=4,
+                           help="Vector-RAG retrieval limit (default: 4)")
+    benchmark.add_argument("--pln-top-k", type=int, default=12,
+                           help="PLN-RAG retrieval limit (default: 12)")
+    benchmark.add_argument("--track", choices=("native", "shared_iterative", "custom"), default="native",
+                           help="native compares architectures; shared_iterative supplies identical iterative top-4 evidence")
+    benchmark.add_argument("--split", default="all",
+                           choices=("all", "reasoning_holdout_v1:development", "reasoning_holdout_v1:heldout"))
+    benchmark.add_argument("--max-rounds", type=int, default=2)
+    benchmark.add_argument("--round-top-k", type=int, default=2)
+    benchmark.add_argument("--max-evidence", type=int, default=4)
     benchmark.add_argument("--run-id")
     benchmark.add_argument("--prepare-only", action="store_true", help="Validate and save a plan without model or embedding calls")
     for name, help_text in (("doctor", "Check the live runtime without calling the LLM"),
@@ -76,6 +87,9 @@ def main(argv: list[str] | None = None) -> int:
                 worlds_path=args.worlds, expected_path=args.expected, world_limit=args.world_limit,
                 normal_repo=args.normal_rag_repo, pln_runtime=args.pln_runtime, container=args.container,
                 repo=args.repo, python=args.python, qdrant_url=args.qdrant_url, ollama_url=args.ollama_url,
+                rag_top_k=args.rag_top_k, pln_top_k=args.pln_top_k, track=args.track,
+                split=args.split, max_rounds=args.max_rounds, round_top_k=args.round_top_k,
+                max_evidence=args.max_evidence,
                 prepare_only=args.prepare_only, run_id=args.run_id)
             if args.prepare_only:
                 return 0

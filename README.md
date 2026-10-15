@@ -3,24 +3,25 @@
 For a detailed explanation of the logic, Docker/API-key flow, every project
 file, configuration settings, and result interpretation, read [GUIDE.md](GUIDE.md).
 
-A separate benchmark project for PLN-RAG, sentence retrieval with an LLM, and
-an LLM given the full world. The work proceeds through a required pilot gate.
+A separate benchmark project for PLN-RAG, one-shot and iterative sentence
+retrieval with an LLM, and an LLM given the full world. The work proceeds
+through a required pilot gate.
 No accuracy results are supplied without a live run.
 
 The original eight-world pilot and the balanced **40-question dataset** are
-implemented. The shared runner tests PLN-RAG, normal RAG and full context on
+implemented. The shared runner tests PLN-RAG, one-shot RAG, iterative RAG, and full context on
 identical inputs. PLN-RAG can run in Docker while both baselines run on the host.
 See [RUNNING.md](RUNNING.md) for configuration, request budgets and result fields.
 
 ```sh
 # Validate and inspect without model calls:
 sudo python3 -m b1 benchmark --container pln-rag-pln-rag-1 --prepare-only
-# Live comparison: 40 questions per system, 120 records:
+# Live comparison: 40 questions per system, 160 records:
 sudo python3 -m b1 benchmark --container pln-rag-pln-rag-1
 ```
 
 The existing `.env` request cap remains in force. A full three-system run is
-roughly 380 chat calls before additional PLN parsing calls; the old 40-call cap
+roughly 420 chat calls before additional PLN parsing calls; the old 40-call cap
 will not cover it. Choose a budget compatible with your account before a live
 run. Implementation/offline tests are separate from live performance results.
 
@@ -198,12 +199,13 @@ of unsupported questions.
 
 The full experiment has five supported questions and five unsupported controls
 in each depth bucket: 20 worlds and 40 questions. Its 240 sentence entries contain
-150 facts and 90 rules. The `benchmark` command produces bucketed and
-supported-only per-depth accuracy with descriptive Wilson 95% intervals. Paired
-questions and repeated templates limit generalization and violate independence.
+150 facts and 90 rules. The `benchmark` command produces bucketed accuracy,
+supported accuracy by depth and proof size, and paired world-cluster bootstrap
+comparisons. Paired questions and repeated templates limit generalization.
 
-Normal RAG retrieves exactly four sentences; full context receives all twelve.
-Both reuse the sibling baseline's existing prompt and answer contract. Unknown
+One-shot and iterative RAG each supply at most four sentences by default; full
+context receives all twelve. Iterative retrieval uses two deterministic rounds
+without LLM query expansion. All baselines reuse the sibling prompt and answer contract. Unknown
 citations are dropped and counted while raw outputs remain untouched. After each
 answer the benchmark records supplied-proof coverage and independently checks
 whether any proof exists in the retrieved subset. Neither diagnostic enters a

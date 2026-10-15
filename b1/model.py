@@ -179,9 +179,13 @@ class Solution:
     def to_dict(self) -> dict[str, Any]:
         best = sorted((sorted(p.sentence_ids) for p in self.proofs if p.depth == self.depth),
                       key=lambda ids: (len(ids), ids))
+        frontier_sizes = [len(p.sentence_ids) for p in self.proofs]
         return {
             "label": self.label, "depth": self.depth,
             "proof_sentence_ids": best[0] if best else [],
             "minimum_depth_proofs": best,
+            "proof_size": len(best[0]) if best else None,
+            "minimum_depth_proof_sizes": [len(ids) for ids in best],
+            "minimum_proof_size": min(frontier_sizes) if frontier_sizes else None,
             "proof_frontier": [{"depth": d, "sentence_ids": list(ids)} for d, ids in self.signature()],
         }

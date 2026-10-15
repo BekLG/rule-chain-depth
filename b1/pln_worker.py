@@ -24,10 +24,32 @@ from .snapshot import restore_snapshot
 from .llm_control import HTTPAudit, LLMSettings
 
 
+ANSWER_GENERATION_FAILURE = "I was unable to generate an answer due to an internal error."
+
+
 def jsonable(value):
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     return json.loads(json.dumps(value, default=str))
+
+
+def bind_component_lms(service, parser, lm) -> None:
+    """Replace component-local DSPy LMs with the benchmark's audited LM."""
+    parser_module = getattr(parser, "_module", None)
+    if parser_module is not None and hasattr(parser_module, "set_lm"):
+        parser_module.set_lm(lm)
+
+    answer_predict = getattr(getattr(service, "_answer_gen", None), "_predict", None)
+    if answer_predict is None:
+        raise AttributeError("PLN-RAG answer generator does not expose its bound DSPy predictor")
+    answer_predict.lm = lm
+
+
+def answer_generation_errors(response: dict, phase: str) -> list[dict]:
+    if response.get("raw_proof") not in (None, "[]") and response.get("answer") == ANSWER_GENERATION_FAILURE:
+        return [{"phase": phase, "kind": "answer_generation_error",
+                 "detail": "PLN-RAG returned its answer-generation failure sentinel"}]
+    return []
 
 
 def run(job: dict) -> dict:
@@ -45,7 +67,7 @@ def run(job: dict) -> dict:
         "NL2PLN_MODULE_PATH": str(repo / "data/simba_all.json"),
         "CONCEPTNET_ENABLED": "false", "CONCEPTNET_AUTOLOAD": "false",
         "ANSWER_GENERATION_ENABLED": "true", "SOURCE_LOOKUP_MAX_ATOMS": "0",
-        "PARSER_BATCH_SENTENCES": "1", "CONTEXT_TOP_K": "12",
+        "PARSER_BATCH_SENTENCES": "1", "CONTEXT_TOP_K": str(job["context_top_k"]),
         "CHAINING_TIMEOUT": str(job["reasoning_timeout"]), "CHAINING_MAX_STEPS": "100",
         "QUERY_FALLBACK_ENABLED": "true", "QUERY_CANDIDATE_MAX_TRIES": "5",
     })
@@ -71,6 +93,10 @@ def run(job: dict) -> dict:
             started = time.perf_counter()
             row = {"phase": phase["name"], "prompt": prompt, "messages": messages}
             try:
+                # DSPy adapters may replace constructor kwargs. Reassert the
+                # OpenRouter routing constraint on every concrete completion.
+                if llm_settings.provider:
+                    kwargs["extra_body"] = llm_settings.kwargs()["extra_body"]
                 response = super().forward(prompt=prompt, messages=messages, **kwargs)
                 row["response"] = jsonable(response)
                 return response
@@ -101,6 +127,8 @@ def run(job: dict) -> dict:
     lm = ObservedLM(cfg.openai_model, api_key=cfg.openai_api_key,
                     **llm_settings.kwargs(), timeout=job["llm_timeout"])
     dspy.configure(lm=lm)
+    # Both components bind LMs during construction, before the audited LM exists.
+    bind_component_lms(service, parser, lm)
 
     original_retrieve = service._vector_store.retrieve_context
 
@@ -151,8 +179,9 @@ def run(job: dict) -> dict:
     common = {"model_requested": job["model"], "parser": type(parser).__name__, "worker_pid": os.getpid(),
               "setup_seconds": setup_seconds, "restore_seconds": restore_seconds,
               "llm_settings": {**llm_settings.public(), "timeout_seconds": job["llm_timeout"]},
-              "reasoning_settings": {"timeout_seconds_per_candidate": job["reasoning_timeout"],
-                                     "candidate_max_tries": 5, "steps": 100},
+               "reasoning_settings": {"timeout_seconds_per_candidate": job["reasoning_timeout"],
+                                      "candidate_max_tries": 5, "steps": 100},
+              "retrieval_top_k": job["context_top_k"],
               "errors": errors, "llm_calls": llm_calls, "llm_http_calls": audit.calls, "parser_calls": parser_calls,
               "reasoner_calls": reasoner_calls, "retrieval_calls": retrieval_calls}
     if job["mode"] == "learn":
@@ -188,14 +217,22 @@ def run(job: dict) -> dict:
     before_atoms = (work / "kb.metta").read_text(encoding="utf-8").splitlines()
     phase["name"] = f"query:{job['question_id']}"
     started = time.perf_counter()
-    response = asyncio.run(service.query(job["question"])).model_dump(mode="json")
+    query_operation = getattr(service, "query", None) or getattr(service, "reason", None)
+    if query_operation is None:
+        raise AttributeError("PLNRAGService exposes neither query() nor reason()")
+    response = asyncio.run(query_operation(job["question"])).model_dump(mode="json")
+    # Current PLN-RAG calls this field `proof`; older images used `raw_proof`.
+    if "raw_proof" not in response and "proof" in response:
+        response["raw_proof"] = response["proof"]
     answer_seconds = time.perf_counter() - started
+    errors.extend(answer_generation_errors(response, phase["name"]))
     label, error_kind = pln_label(response, errors)
     after_atoms = (work / "kb.metta").read_text(encoding="utf-8").splitlines()
     sources = proof_sources(response["raw_proof"], learned["sentences"])
     retrieved_atoms = {atom for row in retrieval_calls for atom in row["context_atoms"]}
     retrieved_ids = sorted({row["sentence_id"] for row in learned["sentences"]
                             if any(atom in retrieved_atoms for atom in row["atoms"])})
+    query_added = [atom for atom in after_atoms if atom not in before_atoms]
     return {**common, "schema_version": 1, "system": "pln_rag", "mode": "query",
             "world_id": job["world_id"], "question_id": job["question_id"],
             "question": job["question"], "label": label, "answer_seconds": answer_seconds,
@@ -204,7 +241,9 @@ def run(job: dict) -> dict:
             "parse_failure_count": learned["parse_failure_count"], "sentence_count": learned["sentence_count"],
             "snapshot_sha256": job["snapshot_sha256"], "before_query_sha256": before,
             "after_query_sha256": file_sha256(work / "kb.metta"),
-            "query_added_statements": [atom for atom in after_atoms if atom not in before_atoms],
+            "query_added_statements": query_added,
+            "query_mutated_state": bool(query_added),
+            "query_added_statement_count": len(query_added),
             "raw_response": response}
 
 

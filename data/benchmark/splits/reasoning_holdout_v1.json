@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "split_id": "reasoning_holdout_v1",
+  "base_dataset_sha256": "8d4bc9726a01284833a09acade4476e885022efcace94c8a6d5b38e98f38fba8",
+  "status": "prospective_holdout",
+  "development_world_ids": [
+    "bench-01", "bench-02", "bench-03", "bench-04", "bench-05", "bench-06",
+    "bench-07", "bench-08", "bench-09", "bench-13", "bench-17"
+  ],
+  "heldout_world_ids": [
+    "bench-10", "bench-11", "bench-12", "bench-14", "bench-15", "bench-16",
+    "bench-18", "bench-19", "bench-20"
+  ],
+  "selection_definition": "Depth 1-3 conjunction, relational, and mixed worlds; supported/control pairs remain intact.",
+  "historical_exposure_note": "These frozen worlds appeared in pre-split benchmark runs; holdout status applies prospectively after this manifest was frozen."
+}

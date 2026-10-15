@@ -19,12 +19,14 @@ except ImportError:
 
 class RequestControlTests(unittest.TestCase):
     def test_model_and_provider_are_configurable_and_routing_is_pinned(self):
-        settings = LLMSettings.from_env({"OPENAI_MODEL": "openrouter/nvidia/example:free", "OPENROUTER_PROVIDER": "nvidia"})
+        settings = LLMSettings.from_env({"OPENAI_MODEL": "openrouter/nvidia/example:free", "OPENROUTER_PROVIDER": "nvidia",
+                                         "B1_LLM_REASONING_EFFORT": "low"})
         self.assertEqual(settings.model, "openrouter/nvidia/example:free")
         self.assertEqual(settings.max_calls, 40)
         self.assertEqual(settings.minimum_interval, 4)
         self.assertEqual(settings.kwargs()["extra_body"]["provider"], {
             "only": ["nvidia"], "order": ["nvidia"], "allow_fallbacks": False, "require_parameters": True})
+        self.assertEqual(settings.kwargs()["extra_body"]["reasoning"], {"effort": "low"})
         self.assertEqual(settings.kwargs()["num_retries"], 0)
 
     def test_free_routes_reject_unbounded_or_unpaced_calls(self):
@@ -59,7 +61,7 @@ class RequestControlTests(unittest.TestCase):
 class HTTPAuditTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
-        self.settings = LLMSettings("openrouter/nvidia/example:free", "https://openrouter.ai/api/v1", "nvidia", 0, 2000, 2, 0)
+        self.settings = LLMSettings("openrouter/nvidia/example:free", "https://openrouter.ai/api/v1", "nvidia", 0, 2000, "low", 2, 0)
         self.errors = []
         self.audit = HTTPAudit(self.settings, Path(self.folder.name) / "budget.json", lambda: "query:q", self.errors)
         self.audit.install()
@@ -100,6 +102,16 @@ class HTTPAuditTests(unittest.TestCase):
         with httpx.Client(transport=httpx.MockTransport(lambda req: sent.append(req))) as client:
             with self.assertRaisesRegex(RuntimeError, "provider pin"):
                 client.post(self.settings.api_base + "/chat/completions", json={"model": "nvidia/example:free"})
+        self.assertEqual(sent, [])
+        self.assertEqual(self.audit.calls, [])
+
+    def test_lost_reasoning_effort_is_rejected_before_network(self):
+        sent = []
+        body = self.body()
+        del body["reasoning"]
+        with httpx.Client(transport=httpx.MockTransport(lambda req: sent.append(req))) as client:
+            with self.assertRaisesRegex(RuntimeError, "reasoning effort"):
+                client.post(self.settings.api_base + "/chat/completions", json=body)
         self.assertEqual(sent, [])
         self.assertEqual(self.audit.calls, [])
 

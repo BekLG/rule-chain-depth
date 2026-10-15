@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from b1.baseline import load_baseline, matched_settings, run_question
-from b1.comparison import annotate, run_comparison, score, skipped_record
+from b1.comparison import annotate, paired_comparison, run_comparison, score, skipped_record
 from b1.dataset import full_dataset, validate_full
 from b1.docker_runtime import inside_benchmark, launch_command, prepare_benchmark
 from b1.language import authored_sentence
@@ -28,7 +28,7 @@ NORMAL = ROOT.parent / "normal-rag"
 ENV = {"OPENAI_MODEL": "openrouter/example/test", "OPENROUTER_PROVIDER": "example",
        "OPENAI_API_KEY": "offline-private-test-key", "PARSER": "canonical_pln",
        "OLLAMA_MODEL": "nomic-embed-text", "OLLAMA_URL": "http://127.0.0.1:11434/api/embeddings",
-       "B1_MAX_LLM_CALLS": "200", "B1_LLM_MIN_INTERVAL": "0"}
+       "B1_LLM_REASONING_EFFORT": "low", "B1_MAX_LLM_CALLS": "200", "B1_LLM_MIN_INTERVAL": "0"}
 
 
 class FullDatasetTests(unittest.TestCase):
@@ -40,6 +40,8 @@ class FullDatasetTests(unittest.TestCase):
         self.assertEqual(annotations, expected)
         result = validate_full(worlds, expected)
         self.assertEqual(result["question_count"], 40)
+        supported = {row["question_id"]: row for row in result["answers"] if row["label"] == "SUPPORTED"}
+        self.assertEqual(supported["bench-12-supported"]["proof_size"], 6)
         self.assertEqual(Counter(q.depth_bucket for w in worlds for q in w.questions), {0: 10, 1: 10, 2: 10, 3: 10})
         self.assertEqual([w.questions[0].depth_bucket for w in worlds[:4]], [0, 1, 2, 3])
         self.assertEqual(sum(len(w.sentences) for w in worlds), 240)
@@ -75,7 +77,7 @@ class ComparisonTests(unittest.TestCase):
         return run_comparison(root, normal_repo=NORMAL, worlds_path=ROOT / "data/benchmark/worlds.json",
             expected_path=ROOT / "data/benchmark/hand_expected.json", **kwargs)
 
-    def test_full_local_orchestration_all_120_records_same_inputs_no_key_leak(self):
+    def test_full_local_orchestration_all_160_records_same_inputs_no_key_leak(self):
         worlds, expected = full_dataset()
         seen_jobs, seen_http = [], []
         def job(python, root, job, output_dir, environment, timeout):
@@ -98,30 +100,40 @@ class ComparisonTests(unittest.TestCase):
                  patch("b1.pln_runner.private_qdrant", return_value=nullcontext()), \
                  patch("b1.pln_runner.process_job", side_effect=job), \
                  patch.object(self.core.HTTP, "post", post), redirect_stdout(io.StringIO()):
-                out = self.run_fake(root, pln_runtime="local", repo=ROOT, python=Path(__file__), run_id="offline")
+                out = self.run_fake(root, pln_runtime="local", repo=ROOT, python=Path(__file__),
+                                    rag_top_k=3, pln_top_k=5, track="custom", run_id="offline")
             records = json.loads((out / "records.json").read_text())
             summary = json.loads((out / "summary.json").read_text())
-            self.assertEqual(len(records), 120)
-            self.assertEqual(Counter(r["system"] for r in records), {s: 40 for s in ("pln_rag", "rag", "full_context")})
+            self.assertEqual(len(records), 160)
+            self.assertEqual(Counter(r["system"] for r in records),
+                             {s: 40 for s in ("pln_rag", "rag", "iterative_rag", "full_context")})
             self.assertTrue(summary["complete"])
             self.assertTrue(summary["full_dataset_selected"])
-            self.assertEqual(summary["requests_reserved"], 140)  # 60 fake PLN requests and 80 real baseline-path fake HTTP requests.
+            self.assertEqual(summary["requests_reserved"], 180)  # 60 fake PLN requests and 120 baseline-path fake HTTP requests.
             self.assertEqual(summary["systems"]["rag"]["accuracy"], 0.5)
+            manifest = json.loads((out / "manifest.json").read_text())
+            self.assertEqual(manifest["retrieval_limits"], {
+                "rag": 3, "pln_rag": 5,
+                "iterative_rag": {"max_rounds": 2, "round_top_k": 2,
+                                  "max_distinct_evidence": 4}})
+            self.assertEqual(summary["systems"]["rag"]["retrieval_top_k"], 3)
             learned = [j for j in seen_jobs if j["mode"] == "learn"]
             self.assertEqual(len(learned), 20)
             for w, j in zip(worlds, learned):
                 self.assertEqual(j["sentences"], [{"id": s.id, "text": s.text} for s in w.sentences])
+                self.assertEqual(j["context_top_k"], 5)
             for j in seen_jobs:
                 self.assertFalse({"expected_label", "depth_bucket", "goal", "repair_fact"} & j.keys())
             chats = [p for p in seen_http if "messages" in p]
-            self.assertEqual(len(chats), 80)
+            self.assertEqual(len(chats), 120)
             for p in chats:
                 message = json.loads(p["messages"][1]["content"])
                 self.assertEqual(set(message), {"sentences", "question"})
                 self.assertEqual(p["temperature"], self.llm.temperature)
                 self.assertEqual(p["max_tokens"], self.llm.max_tokens)
                 self.assertEqual(p["provider"], self.llm.kwargs()["extra_body"]["provider"])
-            self.assertEqual(chats[0]["messages"][0], chats[40]["messages"][0])
+                self.assertEqual(p["reasoning"], {"effort": "low"})
+            self.assertEqual(chats[0]["messages"][0], chats[80]["messages"][0])
             for w in worlds:
                 for q in w.questions:
                     op = out / "full_context" / w.id / q.id
@@ -177,6 +189,90 @@ class ComparisonTests(unittest.TestCase):
             self.assertEqual(json.loads((out / "manifest.json").read_text())["stage"], "prepared_only")
             self.assertFalse((out / "records.json").exists())
 
+    def test_iterative_native_holdout_preparation_is_explicit_and_network_free(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch("b1.comparison.configured_environment", return_value=dict(ENV)), \
+             patch.object(self.core.HTTP, "post", side_effect=AssertionError("No network in prepare")), \
+             redirect_stdout(io.StringIO()):
+            out = self.run_fake(Path(folder), systems=("iterative_rag",), track="native",
+                                split="reasoning_holdout_v1:heldout", prepare_only=True)
+            manifest = json.loads((out / "manifest.json").read_text())
+            self.assertEqual(manifest["comparison_track"], "native")
+            self.assertEqual(manifest["questions_per_system"], 18)
+            self.assertEqual(manifest["selected_world_ids"], [
+                "bench-10", "bench-11", "bench-12", "bench-14", "bench-15",
+                "bench-16", "bench-18", "bench-19", "bench-20"])
+            self.assertEqual(manifest["retrieval_limits"]["iterative_rag"], {
+                "max_rounds": 2, "round_top_k": 2, "max_distinct_evidence": 4})
+
+    def test_native_track_rejects_nonstandard_native_limits(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch("b1.comparison.configured_environment", return_value=dict(ENV)):
+            with self.assertRaisesRegex(ValueError, "native track"):
+                self.run_fake(Path(folder), systems=("rag",), track="native",
+                              rag_top_k=5, prepare_only=True)
+
+    def test_paired_comparison_resamples_worlds_not_individual_questions(self):
+        records = [
+            {"system": "a", "world_id": "w1", "question_id": "q1", "correct": True},
+            {"system": "a", "world_id": "w1", "question_id": "q2", "correct": True},
+            {"system": "b", "world_id": "w1", "question_id": "q1", "correct": False},
+            {"system": "b", "world_id": "w1", "question_id": "q2", "correct": False},
+            {"system": "a", "world_id": "w2", "question_id": "q1", "correct": False},
+            {"system": "a", "world_id": "w2", "question_id": "q2", "correct": False},
+            {"system": "b", "world_id": "w2", "question_id": "q1", "correct": True},
+            {"system": "b", "world_id": "w2", "question_id": "q2", "correct": True},
+        ]
+        result = paired_comparison(records, "a", "b", replicates=100, seed=1)
+        self.assertEqual(result["matched_worlds"], 2)
+        self.assertEqual(result["accuracy_difference_a_minus_b"], 0)
+        self.assertEqual(result["world_score_outcomes"], {"a_wins": 1, "ties": 0, "b_wins": 1})
+        self.assertEqual(result["bootstrap_unit"], "world")
+
+    def test_shared_iterative_track_restricts_every_system_and_pln_learning(self):
+        seen_jobs = []
+        def job(python, root, payload, output_dir, environment, timeout):
+            seen_jobs.append(payload)
+            if payload["mode"] == "learn":
+                return {"world_id": payload["world_id"], "errors": [], "sentences": [],
+                        "snapshot_path": "offline", "snapshot_sha256": "offline",
+                        "learning_seconds": 1, "parse_failure_count": 0}, 1, "", None
+            return {"world_id": payload["world_id"], "question_id": payload["question_id"],
+                    "label": "NOT_ESTABLISHED", "errors": [], "answer_seconds": 1,
+                    "used_sentence_ids": [], "retrieved_sentence_ids": []}, 1, "", None
+        with tempfile.TemporaryDirectory() as folder, \
+             patch("b1.comparison.configured_environment", return_value=dict(ENV)), \
+             patch("b1.pln_runner.repository_manifest", return_value={"offline": True}), \
+             patch("b1.pln_runner.private_qdrant", return_value=nullcontext()), \
+             patch("b1.pln_runner.process_job", side_effect=job), \
+             patch.object(self.core.HTTP, "post", lambda http, url, payload, headers, timeout: self.response(payload)), \
+             redirect_stdout(io.StringIO()):
+            out = self.run_fake(Path(folder), systems=("pln_rag", "rag", "iterative_rag", "full_context"),
+                                track="shared_iterative", world_limit=1, pln_runtime="local",
+                                repo=ROOT, python=Path(__file__))
+            records = json.loads((out / "records.json").read_text())
+            manifest = json.loads((out / "manifest.json").read_text())
+        self.assertEqual(manifest["comparison_track"], "shared_iterative")
+        evidence = {row["question_id"]: row["evidence_access_ids"]
+                    for row in records if row["system"] == "iterative_rag"}
+        self.assertTrue(all(len(ids) == 4 for ids in evidence.values()))
+        for row in records:
+            self.assertEqual(row["evidence_access_ids"], evidence[row["question_id"]])
+            self.assertEqual(row["evidence_policy"], "shared_iterative_top4")
+        learned = [payload for payload in seen_jobs if payload["mode"] == "learn"]
+        self.assertEqual(len(learned), 2)
+        for payload in learned:
+            question_id = Path(payload["work_dir"]).parent.name
+            self.assertEqual([row["id"] for row in payload["sentences"]], evidence[question_id])
+            self.assertEqual(payload["context_top_k"], 4)
+
+    def test_invalid_retrieval_limits_fail_before_artifact_creation(self):
+        for name, value in (("rag_top_k", 0), ("pln_top_k", -1)):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as folder, \
+                 patch("b1.comparison.configured_environment", return_value=dict(ENV)):
+                with self.assertRaises(ValueError):
+                    self.run_fake(Path(folder), systems=("rag",), prepare_only=True, **{name: value})
+
     def test_malformed_completion_is_untouched_error_without_repair(self):
         sent = []
         raw = b'{"provider":"Example","choices":[{"message":{"content":"not json"}}]}'
@@ -212,6 +308,21 @@ class ComparisonTests(unittest.TestCase):
         row = annotate(record, "rag", w, q, {"proof_sentence_ids": expected[q.id]["minimum_depth_proofs"][0]})
         self.assertFalse(row["proof_coverage"]["retrieved_contains_required"])
         self.assertTrue(row["proof_coverage"]["retrieved_proves_claim"])
+
+    def test_citation_proof_and_query_mutation_are_separate_diagnostics(self):
+        worlds, expected = full_dataset()
+        world = worlds[0]
+        question = world.questions[0]
+        required = expected[question.id]["minimum_depth_proofs"][0]
+        baseline = {"label": "SUPPORTED", "attempted": True, "retrieved": [], "context": [],
+                    "cited": required, "retrieval_top_k": 4}
+        baseline = annotate(baseline, "rag", world, question, {"proof_sentence_ids": required})
+        self.assertTrue(baseline["proof_coverage"]["citation_proves_claim"])
+        pln = {"label": "SUPPORTED", "attempted": True, "retrieved_sentence_ids": [],
+               "retrieval_calls": [], "query_added_statements": ["(: queried_claim PredicateNode)"]}
+        pln = annotate(pln, "pln_rag", world, question, {"proof_sentence_ids": required})
+        self.assertTrue(pln["potential_query_contamination"])
+        self.assertEqual(pln["proof_coverage"]["citation_proves_claim"], "unmeasured")
 
     def test_failed_pln_launch_still_records_all_questions_and_runs_host_baseline(self):
         captured = []
@@ -324,6 +435,13 @@ reserve_request(Path(job['request_budget_path']), 4, 0)
             self.assertEqual(run.call_args.args[3], Path("staged-worlds.json"))
             self.assertEqual(run.call_args.kwargs["request_budget_path"], Path("shared-budget.json"))
             self.assertEqual(run.call_args.kwargs["dataset_kind"], "benchmark")
+
+    def test_inside_dispatch_rejects_unresolved_controlled_evidence(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "job.json"
+            path.write_text(json.dumps({"controlled_evidence_pending": True}))
+            with self.assertRaisesRegex(RuntimeError, "not been materialized"):
+                inside_benchmark(path)
 
     def test_wilson_intervals_and_empty_groups(self):
         rows = [{"correct": True, "label": "SUPPORTED", "attempted": True, "answer_seconds": 2}] * 5

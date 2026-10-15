@@ -1,8 +1,8 @@
 # Running the shared 40-question benchmark
 
 The `benchmark` command tests identical worlds and questions with PLN-RAG,
-normal RAG, and an LLM given full context. PLN-RAG can use your Docker image;
-normal RAG and full context run in the host Python process. The sibling
+one-shot RAG, iterative multi-hop RAG, and an LLM given full context. PLN-RAG
+can use your Docker image; vector RAG and full context run in the host process. The sibling
 repositories are read without changing their source or `.env` files.
 
 ## What is implemented
@@ -46,6 +46,7 @@ OLLAMA_URL=http://127.0.0.1:11434/api/embeddings
 B1_QDRANT_URL=http://127.0.0.1:6333
 B1_LLM_TEMPERATURE=0
 B1_LLM_MAX_TOKENS=2000
+B1_LLM_REASONING_EFFORT=medium
 B1_LLM_TIMEOUT=90
 B1_QUERY_TIMEOUT=240
 B1_LEARN_TIMEOUT=900
@@ -61,21 +62,30 @@ Buying credits does not edit local settings or change a `:free` model into its
 paid route. Model/provider availability and account limits still apply.
 
 One cap covers the entire comparison, including PLN-RAG sentence parsing,
-question parsing, answer generation, and both baselines. The default order is
-PLN-RAG, normal RAG, full context. Earlier systems can exhaust the shared cap.
+question parsing, answer generation, and all baselines. The default order is
+PLN-RAG, one-shot RAG, iterative RAG, full context. Earlier systems can exhaust the shared cap.
 A new run has a fresh local counter; your remote account allowance is shared.
 
 A rough full-run estimate is 300 PLN calls (240 sentence parses, 40 question
-parses, 20 answer generations) plus 40 calls per baseline: about **380 calls**
+parses, 20 answer generations) plus 40 calls per baseline: about **420 calls**
 before extra PLN formatting/parsing calls. Some unsupported or missed proofs
 avoid answer-generation calls. This estimate is not a guarantee. The runner
 keeps your configured cap, including the original 40 if you have not changed it.
 
 The shared runner strips the `openrouter/` routing prefix for the baseline's
 direct API request. The model ID, provider pin, API key/base URL, temperature,
-output limit, and LLM timeout are otherwise matched. All embeddings use local
-Ollama with `nomic-embed-text`. Baseline retrieval remains exactly top four;
-full context skips retrieval and uses the identical baseline prompt.
+reasoning effort, output limit, and LLM timeout are otherwise matched. All embeddings use local
+Ollama with `nomic-embed-text`. `--track native` records the primary native
+comparison and requires one-shot top four plus PLN top 12. `--track custom`
+labels explicit capacity ablations. Iterative RAG defaults to two rounds, two
+additions per round, and four distinct evidence sentences; `--max-rounds`,
+`--round-top-k`, and `--max-evidence` configure it. Full context skips retrieval
+and uses the identical baseline prompt.
+
+`--track shared_iterative` is a secondary controlled diagnostic. Iterative RAG
+selects four ordered IDs per question; every host baseline receives only that
+context and PLN learns a fresh per-question KB containing only those IDs. The
+records audit the evidence contract and fail closed on out-of-policy access.
 
 ## Validate without model calls
 
@@ -118,7 +128,7 @@ sudo python3 -m b1 benchmark \
   --container pln-rag-pln-rag-1
 ```
 
-This selects all 20 worlds: **40 questions per system, 120 records total**.
+This selects all 20 worlds: **40 questions per system, 160 records total**.
 The host command needs Python 3.10+ and the sibling normal-RAG source; its
 baseline uses only the standard library. Docker supplies PLN-RAG's Python and
 native dependencies. Ollama and Qdrant must be reachable at the configured URLs.
@@ -131,7 +141,7 @@ sudo python3 -m b1 benchmark \
   --world-limit 4
 ```
 
-That produces eight questions per system, 24 records total. Use `--world-limit 1`
+That produces eight questions per system, 32 records total. Use `--world-limit 1`
 for the smallest two-question-per-system trial.
 
 To use the original pilot data on all systems, add `--dataset pilot`. This
@@ -148,6 +158,9 @@ sudo python3 -m b1 benchmark --systems pln_rag \
 
 # Normal RAG and full context only, on the host: 80 records
 python3 -m b1 benchmark --systems rag full_context
+
+# Iterative multi-hop RAG only: 40 records
+python3 -m b1 benchmark --systems iterative_rag
 
 # Normal RAG only: 40 records
 python3 -m b1 benchmark --systems rag
@@ -196,8 +209,8 @@ Each invocation creates `artifacts/benchmark/<run-id>/`:
 |---|---|
 | `manifest.json` | Selected systems/worlds, settings, source hashes, dataset fingerprint, image ID, and run stage. |
 | `worlds.json`, `hand_expected.json`, `oracle.json` | Frozen full input dataset and independently validated answers. Selected IDs are in the manifest. |
-| `report.md` | Overall and per-depth accuracy, error counts, and links to each record. |
-| `summary.json` | Per-depth, supported-only per-depth, per-kind and per-label scores; descriptive Wilson 95% intervals; provider/model reports; token totals and missing-measurement counts. |
+| `report.md` | Overall, per-depth, proof-size, and paired accuracy; error counts; links to each record. |
+| `summary.json` | Per-depth, proof-size, per-kind and per-label scores; deterministic world-cluster bootstrap comparisons; descriptive Wilson intervals; provider/model reports; token totals and missing-measurement counts. |
 | `records.json` | One record per selected question/system, including errors and explicit skipped records. |
 | `llm_requests.json` | HTTP audits grouped by system, including provider/model, usage, pacing, requests, and raw response text. |
 | `docker.launch.json`, `docker.doctor.json` | Docker setup evidence when using the container runtime. |
@@ -233,8 +246,9 @@ capacity limit; compare it with full context rather than increasing retrieval.
 
 PLN learning time is separate from query time. Query time includes LLM and
 pacing waits; normal-RAG index-building time is stored separately per question.
-Wilson intervals are descriptive: shared worlds and templates violate the
-independence assumption of a simple binomial sample.
+Pairwise bootstrap intervals resample whole worlds, preserving each world's
+supported/control pair. Wilson intervals are descriptive: shared worlds and
+templates violate the independence assumption of a simple binomial sample.
 
 The [documented one-world run from 2026-10-07](artifacts/analysis/20261007T111319Z-d88e08.md)
 completed with PLN-RAG 0/2 and RAG 2/2. Its evidence explains a malformed PLN

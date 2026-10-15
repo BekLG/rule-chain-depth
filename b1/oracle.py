@@ -90,7 +90,8 @@ def validate(worlds: tuple[World, ...], hand_expected: dict | None = None) -> di
         raise ValueError("Hand-annotated question IDs do not match dataset")
     return {"schema_version": 1, "dataset_sha256": fingerprint(worlds),
             "status": "AGREED", "world_count": len(worlds), "question_count": len(answers),
-            "solvers": ["forward_saturation", "backward_goal_search"],
-            "depth_definition": "0 for a fact; 1 + max(premise depths) for a rule application; null when unsupported",
-            "control_bucket_definition": "Depth of the paired supported target, also verified after adding the control's one missing fact",
+             "solvers": ["forward_saturation", "backward_goal_search"],
+             "depth_definition": "0 for a fact; 1 + max(premise depths) for a rule application; null when unsupported",
+            "proof_size_definition": "Number of distinct source sentences in the canonical smallest minimum-depth proof; null when unsupported",
+             "control_bucket_definition": "Depth of the paired supported target, also verified after adding the control's one missing fact",
             "answers": answers}

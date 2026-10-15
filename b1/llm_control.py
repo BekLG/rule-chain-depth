@@ -18,6 +18,7 @@ class LLMSettings:
     provider: str | None
     temperature: float
     max_tokens: int
+    reasoning_effort: str | None
     max_calls: int
     minimum_interval: float
 
@@ -36,11 +37,13 @@ class LLMSettings:
         if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("The LLM base URL must be HTTPS without embedded credentials")
         result = cls(model, api_base, provider, float(env.get("B1_LLM_TEMPERATURE", "0")),
-                     int(env.get("B1_LLM_MAX_TOKENS", "2000")),
-                     int(env.get("B1_MAX_LLM_CALLS", "40" if router else "0")),
+                      int(env.get("B1_LLM_MAX_TOKENS", "2000")),
+                      env.get("B1_LLM_REASONING_EFFORT") or None,
+                      int(env.get("B1_MAX_LLM_CALLS", "40" if router else "0")),
                      float(env.get("B1_LLM_MIN_INTERVAL", "4" if router else "0")))
         if (not math.isfinite(result.temperature) or not 0 <= result.temperature <= 2
                 or result.max_tokens < 1 or result.max_calls < 0
+                or result.reasoning_effort not in (None, "low", "medium", "high")
                 or not math.isfinite(result.minimum_interval) or result.minimum_interval < 0):
             raise ValueError("Invalid LLM temperature, token limit, request budget, or pacing interval")
         if router and model.endswith(":free") and (result.max_calls == 0 or result.minimum_interval < 3.1):
@@ -50,6 +53,7 @@ class LLMSettings:
     def public(self) -> dict:
         return {"model": self.model, "api_base": self.api_base, "provider": self.provider,
                 "temperature": self.temperature, "max_tokens": self.max_tokens,
+                "reasoning_effort": self.reasoning_effort,
                 "max_calls": self.max_calls, "minimum_interval": self.minimum_interval,
                 "allow_fallbacks": False, "num_retries": 0, "cache": False}
 
@@ -58,7 +62,9 @@ class LLMSettings:
                   "api_base": self.api_base, "cache": False, "num_retries": 0}
         if self.provider:
             result["extra_body"] = {"provider": {"order": [self.provider], "only": [self.provider],
-                                                  "allow_fallbacks": False, "require_parameters": True}}
+                                                   "allow_fallbacks": False, "require_parameters": True}}
+            if self.reasoning_effort:
+                result["extra_body"]["reasoning"] = {"effort": self.reasoning_effort}
         return result
 
 
@@ -122,7 +128,16 @@ class HTTPAudit:
             raise RuntimeError("The previous LLM request failed; no additional request was sent")
         body = json.loads(request.content)
         if self.settings.provider and body.get("provider") != self.settings.kwargs()["extra_body"]["provider"]:
-            raise RuntimeError("The outgoing request did not preserve the configured provider pin")
+            observed = body.get("provider", "missing")
+            raise RuntimeError(
+                f"The outgoing request did not preserve the configured provider pin; observed {observed!r}"
+            )
+        expected_reasoning = self.settings.kwargs().get("extra_body", {}).get("reasoning")
+        if body.get("reasoning") != expected_reasoning:
+            raise RuntimeError(
+                "The outgoing request did not preserve the configured reasoning effort; "
+                f"observed {body.get('reasoning', 'missing')!r}"
+            )
         number, wait = reserve_request(self.budget, self.settings.max_calls, self.settings.minimum_interval)
         row = {"request_number": number, "phase": self.phase(), "request": body,
                "rate_wait_seconds": wait, **response_metadata({})}

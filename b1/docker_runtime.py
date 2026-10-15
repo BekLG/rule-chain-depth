@@ -72,7 +72,7 @@ def prepare_benchmark(root: Path, container: str, job: dict, environment: dict) 
     names = ("OPENAI_API_KEY", "OPENAI_MODEL", "PARSER", "OPENROUTER_PROVIDER", "OPENROUTER_BASE_URL",
              "OLLAMA_MODEL", "B1_LLM_TEMPERATURE", "B1_LLM_MAX_TOKENS", "B1_MAX_LLM_CALLS",
              "B1_LLM_MIN_INTERVAL", "B1_LLM_TIMEOUT", "B1_QUERY_TIMEOUT", "B1_LEARN_TIMEOUT",
-             "B1_REASONING_TIMEOUT")
+             "B1_REASONING_TIMEOUT", "B1_PLN_TOP_K")
     command = launch_command(root, inspected, job["run_id"], job["world_limit"],
                              environment["B1_QDRANT_URL"], environment["OLLAMA_URL"],
                              job_path=job_path, forwarded_env=names)
@@ -87,6 +87,8 @@ def inside_benchmark(job_path: Path) -> int:
     from .doctor import doctor
     from .pln_runner import run_pln
     job = json.loads(job_path.read_text())
+    if job.get("controlled_evidence_pending"):
+        raise RuntimeError("Controlled evidence has not been materialized by the host selector")
     root = Path.cwd()
     result = doctor(root, Path("/app"), Path(sys.executable), job_path.parent / "docker.doctor.json")
     if not result["ready"]:
@@ -95,7 +97,9 @@ def inside_benchmark(job_path: Path) -> int:
     run_pln(root, Path("/app"), Path(sys.executable), Path(job["worlds_path"]),
             Path(job["expected_path"]), job["run_id"], job["world_limit"],
             dataset_kind=job["dataset_kind"], output_dir=Path(job["output_dir"]),
-            request_budget_path=Path(job["request_budget_path"]))
+            request_budget_path=Path(job["request_budget_path"]),
+            selected_world_ids=job.get("selected_world_ids"),
+            evidence_ids_by_question=job.get("evidence_ids_by_question"))
     return 0  # Result accuracy/errors are reported in records and the shared summary.
 
 

@@ -38,6 +38,7 @@ def matched_settings(config, env: dict, llm):
     return config.Settings(api_key=env.get("OPENAI_API_KEY", ""),
         model=llm.model.removeprefix("openrouter/"), base_url=llm.api_base,
         provider=llm.provider, temperature=llm.temperature, max_tokens=llm.max_tokens,
+        reasoning_effort=llm.reasoning_effort,
         timeout_seconds=float(env.get("B1_LLM_TIMEOUT", "60")),
         ollama_url=env.get("OLLAMA_URL", "http://127.0.0.1:11434/api/embeddings"),
         embedding_timeout_seconds=float(env.get("B1_EMBEDDING_TIMEOUT", "30")))
@@ -54,6 +55,8 @@ class BudgetHTTP:
             return self.transport.post(url, payload, headers, timeout)
         if payload.get("provider") != self.llm.kwargs()["extra_body"]["provider"]:
             raise self.core.Failure("provider_pin_lost")
+        if payload.get("reasoning") != self.llm.kwargs()["extra_body"].get("reasoning"):
+            raise self.core.Failure("reasoning_effort_lost")
         try:
             number, wait = reserve_request(self.budget, self.llm.max_calls, self.llm.minimum_interval)
         except RequestBudgetExceeded:
@@ -78,12 +81,21 @@ class BudgetHTTP:
             row["seconds"] = time.perf_counter() - started
 
 
-def run_question(core, settings, llm, budget, sentences, question, mode, output, *, transport=None):
+def run_question(core, settings, llm, budget, sentences, question, mode, output, *,
+                  transport=None, top_k=4, prepared_index=None, max_rounds=2,
+                  round_top_k=2, max_evidence=4):
     """Only public sentences and question text cross into the baseline call."""
     http = BudgetHTTP(core, settings, llm, budget, mode, transport)
-    answer = core.answer_question(sentences, question, mode, settings, http=http)
+    answer = core.answer_question(sentences, question, mode, settings, http=http,
+                                  top_k=top_k, prepared_index=prepared_index,
+                                  max_rounds=max_rounds, round_top_k=round_top_k,
+                                  max_evidence=max_evidence)
     output.mkdir(parents=True, exist_ok=False)
-    write_json(output / "input.json", {"sentences": sentences, "question": question, "mode": mode})
+    write_json(output / "input.json", {"sentences": sentences, "question": question,
+                                        "mode": mode, "top_k": top_k if mode == "rag" else None,
+                                        "iterative_retrieval": ({"max_rounds": max_rounds,
+                                            "round_top_k": round_top_k, "max_evidence": max_evidence}
+                                            if mode == "iterative_rag" else None)})
     if answer.request is not None:
         write_json(output / "request.json", answer.request)
     if answer.response_body is not None:

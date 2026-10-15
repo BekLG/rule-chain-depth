@@ -149,7 +149,9 @@ def render_raw_report(worlds, records: list[dict], learning: list[dict], out: Pa
 def run_pln(root: Path, repo: Path, python: Path, worlds_path: Path,
             expected_path: Path, run_id: str | None = None, world_limit: int = 8, *,
             dataset_kind: str = "pilot", output_dir: Path | None = None,
-            request_budget_path: Path | None = None, environment: dict | None = None) -> Path:
+            request_budget_path: Path | None = None, environment: dict | None = None,
+            selected_world_ids: list[str] | None = None,
+            evidence_ids_by_question: dict[str, list[str]] | None = None) -> Path:
     worlds = read_worlds(worlds_path)
     expected = json.loads(expected_path.read_text(encoding="utf-8"))
     if dataset_kind == "benchmark":
@@ -162,9 +164,30 @@ def run_pln(root: Path, repo: Path, python: Path, worlds_path: Path,
     else:
         raise ValueError("Unknown dataset kind")
     total_worlds = len(worlds)
-    if not 1 <= world_limit <= total_worlds:
-        raise ValueError(f"world_limit must be between 1 and {total_worlds}")
-    worlds = worlds[:world_limit]  # The entire frozen dataset was validated above.
+    if selected_world_ids is not None:
+        if len(selected_world_ids) != len(set(selected_world_ids)):
+            raise ValueError("selected_world_ids contains duplicates")
+        selected = set(selected_world_ids)
+        if not selected <= {world.id for world in worlds}:
+            raise ValueError("selected_world_ids contains unknown worlds")
+        worlds = [world for world in worlds if world.id in selected]
+        if [world.id for world in worlds] != selected_world_ids:
+            raise ValueError("selected_world_ids must follow frozen dataset order")
+        world_limit = len(worlds)
+    else:
+        if not 1 <= world_limit <= total_worlds:
+            raise ValueError(f"world_limit must be between 1 and {total_worlds}")
+        worlds = worlds[:world_limit]  # The entire frozen dataset was validated above.
+    selected_questions = {question.id for world in worlds for question in world.questions}
+    if evidence_ids_by_question is not None:
+        if set(evidence_ids_by_question) != selected_questions:
+            raise ValueError("Controlled evidence must cover every selected question exactly once")
+        for world in worlds:
+            allowed = {sentence.id for sentence in world.sentences}
+            for question in world.questions:
+                ids = evidence_ids_by_question[question.id]
+                if not ids or len(ids) != len(set(ids)) or not set(ids) <= allowed:
+                    raise ValueError(f"Invalid controlled evidence for {question.id}")
     env = dict(environment) if environment is not None else configured_environment(root)
     key = env.get("OPENAI_API_KEY", "").strip()
     if key in ("", "sk-...", "your-api-key"):
@@ -185,7 +208,11 @@ def run_pln(root: Path, repo: Path, python: Path, worlds_path: Path,
                "stage": dataset_kind, "full_dataset_world_count": total_worlds,
                "selected_world_ids": [w.id for w in worlds], "llm_settings": llm_settings.public(),
                "docker_image": env.get("B1_DOCKER_IMAGE"),
-               "snapshot_policy": "learn once; restore atom file and fresh OS process per question; unique world vector collection"})
+               "evidence_policy": "controlled_per_question" if evidence_ids_by_question is not None else "native_world_kb",
+               "evidence_ids_by_question": evidence_ids_by_question,
+               "snapshot_policy": ("learn only the selected evidence in a unique collection and process per question"
+                   if evidence_ids_by_question is not None else
+                   "learn once; restore atom file and fresh OS process per question; unique world vector collection")})
     request_budget_path = request_budget_path or root / "runtime/runs" / run_id / "request_budget.json"
     qdrant = env.get("B1_QDRANT_URL", "http://127.0.0.1:16333")
     records, learning = [], []
@@ -193,61 +220,91 @@ def run_pln(root: Path, repo: Path, python: Path, worlds_path: Path,
         with private_qdrant(root, qdrant, run_id, env):
             for world in worlds:
                 print(f"START {world.id}: {world.questions[0].rule_kind}, depth {world.questions[0].depth_bucket}", flush=True)
-                common = {"repo_path": str(repo), "model": env["OPENAI_MODEL"], "parser": env["PARSER"],
-                          "world_id": world.id, "qdrant_url": qdrant,
-                          "collection": f"b1_{run_id}_{world.id}".replace("-", "_"),
-                          "reasoning_timeout": int(env.get("B1_REASONING_TIMEOUT", "30")),
-                          "llm_config": asdict(llm_settings), "request_budget_path": str(request_budget_path),
-                          "llm_timeout": int(env.get("B1_LLM_TIMEOUT", "60"))}
-                learn_job = {**common, "mode": "learn", "sentences": public_sentences(world),
-                             "work_dir": str(root / "runtime/runs" / run_id / world.id / "learn")}
-                learn_out = out / world.id / "learn"
-                learned, wall, log, failure = process_job(python, root, learn_job, learn_out, env,
-                                                        float(env.get("B1_LEARN_TIMEOUT", "900")))
-                learn_errors = log_errors(log)
-                if learned and not learned.get("worker_error"):
-                    learned["worker_wall_seconds"] = wall
-                    learned["errors"].extend(learn_errors)
-                    learning.append(learned)
-                    write_json(learn_out / "output.json", learned)
-                if learned and learned.get("errors"):
-                    failure = learned["errors"][0]["kind"]
-                if learned and learned.get("worker_error"):
-                    failure = "learning_error"
-                for question in world.questions:
+                def learn(scope, supplied_sentences, learn_out):
+                    common = {"repo_path": str(repo), "model": env["OPENAI_MODEL"], "parser": env["PARSER"],
+                              "world_id": world.id, "qdrant_url": qdrant,
+                              "collection": f"b1_{run_id}_{world.id}_{scope}".replace("-", "_"),
+                              "reasoning_timeout": int(env.get("B1_REASONING_TIMEOUT", "30")),
+                              "context_top_k": min(int(env.get("B1_PLN_TOP_K", "12")), len(supplied_sentences)),
+                              "llm_config": asdict(llm_settings), "request_budget_path": str(request_budget_path),
+                              "llm_timeout": int(env.get("B1_LLM_TIMEOUT", "60"))}
+                    learn_job = {**common, "mode": "learn", "sentences": supplied_sentences,
+                                 "work_dir": str(root / "runtime/runs" / run_id / world.id / scope / "learn")}
+                    learned, wall, log, failure = process_job(
+                        python, root, learn_job, learn_out, env, float(env.get("B1_LEARN_TIMEOUT", "900")))
+                    learn_errors = log_errors(log)
+                    if learned and not learned.get("worker_error"):
+                        learned["worker_wall_seconds"] = wall
+                        learned["errors"].extend(learn_errors)
+                        learning.append(learned)
+                        write_json(learn_out / "output.json", learned)
+                    if learned and learned.get("errors"):
+                        failure = learned["errors"][0]["kind"]
+                    if learned and learned.get("worker_error"):
+                        failure = "learning_error"
+                    return common, learned, wall, failure
+
+                def query(question, common, learned, wall, failure, learn_out, supplied_count):
                     query_out = out / world.id / question.id
                     if failure or not learned:
                         record = error_record(world.id, question.id, 0.0, failure or "learning_error",
-                                              "The world could not be learned; see its learning output and raw.log")
+                                              "The evidence could not be learned; see its learning output and raw.log")
                         record["attempted"] = False
                         record["learning_worker_wall_seconds"] = wall
                     else:
-                        query_job = {**common, "mode": "query", "question_id": question.id, "question": question.text,
+                        query_job = {**common, "mode": "query", "question_id": question.id,
+                                     "question": question.text,
                                      "work_dir": str(root / "runtime/runs" / run_id / world.id / question.id),
-                                     "snapshot_path": learned["snapshot_path"], "snapshot_sha256": learned["snapshot_sha256"],
+                                     "snapshot_path": learned["snapshot_path"],
+                                     "snapshot_sha256": learned["snapshot_sha256"],
                                      "learn_output_path": str(learn_out / "output.json")}
                         record, query_wall, query_log, query_failure = process_job(
                             python, root, query_job, query_out, env, float(env.get("B1_QUERY_TIMEOUT", "180")))
                         if query_failure or not record or record.get("worker_error"):
-                            record = error_record(world.id, question.id, query_wall, query_failure or "worker_error",
+                            record = error_record(world.id, question.id, query_wall,
+                                                  query_failure or "worker_error",
                                                   "Query worker failed; see raw.log and worker output")
                         else:
                             record["worker_wall_seconds"] = query_wall
                             observed = log_errors(query_log)
                             if observed:
                                 record["errors"].extend(observed)
-                                record.update(label="ERROR", error_kind=observed[0]["kind"], error_detail=observed[0]["detail"])
-                    record["depth_bucket"] = question.depth_bucket
-                    record["rule_kind"] = question.rule_kind
-                    record["expected_label"] = question.expected_label
-                    record["correct"] = is_correct(record, question.expected_label)
-                    record["parse_failure_count"] = learned.get("parse_failure_count") if learned else None
-                    record["sentence_count"] = len(world.sentences)
-                    validate_record(record, {s.id for s in world.sentences})
+                                record.update(label="ERROR", error_kind=observed[0]["kind"],
+                                              error_detail=observed[0]["detail"])
+                    record.update(depth_bucket=question.depth_bucket, rule_kind=question.rule_kind,
+                                  expected_label=question.expected_label,
+                                  correct=is_correct(record, question.expected_label),
+                                  parse_failure_count=(learned.get("parse_failure_count") if learned else None),
+                                  sentence_count=supplied_count,
+                                  evidence_access_ids=(evidence_ids_by_question.get(question.id)
+                                                       if evidence_ids_by_question is not None else
+                                                       [sentence.id for sentence in world.sentences]))
+                    validate_record(record, {sentence.id for sentence in world.sentences})
                     write_json(query_out / "record.json", record)
                     records.append(record)
                     write_json(out / "records.json", records)
                     print(f"RESULT {question.id}: {record['label']} (oracle {question.expected_label}), {record['answer_seconds']:.3f}s", flush=True)
+
+                if evidence_ids_by_question is None:
+                    supplied = public_sentences(world)
+                    learn_out = out / world.id / "learn"
+                    common, learned, wall, failure = learn("world", supplied, learn_out)
+                    question_runs = [(question, common, learned, wall, failure, learn_out, len(supplied))
+                                     for question in world.questions]
+                else:
+                    question_runs = []
+                    by_id = {sentence.id: sentence for sentence in world.sentences}
+                    failure = None
+                    for question in world.questions:
+                        ids = evidence_ids_by_question[question.id]
+                        supplied = [{"id": sentence_id, "text": by_id[sentence_id].text} for sentence_id in ids]
+                        learn_out = out / world.id / question.id / "learn"
+                        common, learned, wall, failure = learn(question.id, supplied, learn_out)
+                        question_runs.append((question, common, learned, wall, failure, learn_out, len(supplied)))
+                        if failure:
+                            break
+                for question_run in question_runs:
+                    query(*question_run)
                 # Infrastructure failure cannot diagnose a rule kind. Stop burning calls.
                 if failure:
                     print(f"STOP: learning/runtime failure in {world.id}: {failure}", flush=True)
